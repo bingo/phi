@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+
+# 本地配置与密钥
+config.toml
+.env
+
+# 数据库
+*.db
+*.db-shm
+*.db-wal
+/data

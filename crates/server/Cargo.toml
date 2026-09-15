@@ -1,0 +1,13 @@
+[package]
+name = "phi-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+phi-core.workspace = true
+anyhow.workspace = true
+
+# v0.4 再加 axum。现在只占个位，保证 workspace 形状和 DESIGN.md 一致，
+# 同时不让一个还没写的 crate 拖慢编译。

@@ -1,0 +1,43 @@
+# 复制成 config.toml 后填写。config.toml 不入版本库。
+# 也可以用环境变量覆盖，前缀 PHI_，双下划线表示层级：
+#   PHI_ANALYZER__MODEL="deepseek/deepseek-v4.1-flash"
+
+[db]
+# 相对路径按当前工作目录解析
+path = "phi.db"
+
+[producthunt]
+# https://www.producthunt.com/v2/oauth/applications 里生成 Developer Token
+token_env = "PH_TOKEN"
+api_url = "https://api.producthunt.com/v2/api/graphql"
+# 复杂度配额 6250 / 15min。剩余低于这个数就停下来并保存游标。
+complexity_floor = 500
+
+[analyzer]
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4.1-flash"
+api_key_env = "OPENROUTER_API_KEY"
+temperature = 0.3
+# OpenRouter 的结构化输出支持是 provider 级而非 model 级的。
+# 关掉这个等于允许被路由到不支持 json_schema 的 provider。别关。
+require_parameters = true
+prompt_path = "prompts/card.v1.md"
+
+[comment_filter]
+# 过滤的目的是信号密度，不是省钱 —— 模型侧成本可以忽略，
+# 但 200 条 "Congrats 🎉" 会稀释模型对真正抱怨那几条的注意力。
+# 注意：按「字符」数算，不是字节。这个值是照英文语料调的 ——
+# 中文单字信息量高得多，60 个中文字符已经是一条有内容的抱怨了。
+# 以后接中文源（36kr 之类）时要把它调低，否则会误杀一片。
+min_length = 60
+top_n = 80                 # 0 = 不限
+keep_all_maker_comments = true
+noise_max_length = 150
+noise_patterns = [
+    "(?i)congrat",
+    "(?i)good luck",
+    "(?i)all the best",
+    "(?i)looks (great|awesome|cool|amazing)",
+    "(?i)love (this|it)",
+    "(?i)^\\s*(nice|cool|awesome|great|amazing|wow)\\b",
+]

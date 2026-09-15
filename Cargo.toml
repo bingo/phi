@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/sources",
+    "crates/analyzer",
+    "crates/cli",
+    "crates/server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+
+[workspace.dependencies]
+phi-core = { path = "crates/core" }
+phi-sources = { path = "crates/sources" }
+phi-analyzer = { path = "crates/analyzer" }
+
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "sqlite",
+    "migrate",
+    # macros 只是为了 `sqlx::migrate!` —— 它把 migrations 编译进二进制。
+    # 刻意不用 `query!` 宏：那个要求编译期能连上真实数据库（DATABASE_URL），
+    # 对一个自用工具来说不值这个麻烦。
+    "macros",
+    "chrono",
+] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+regex = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+
+[profile.release]
+lto = "thin"
+strip = true

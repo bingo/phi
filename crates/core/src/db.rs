@@ -10,7 +10,8 @@ use std::path::Path;
 use std::str::FromStr;
 
 use crate::model::{
-    Analysis, Comment, Evidence, Item, NewComment, NewItem, OpportunityCard, Usage,
+    Analysis, Comment, Evidence, Item, ItemSummary, NewComment, NewItem, OpportunityCard, Tri,
+    Usage, Verdict,
 };
 
 pub async fn connect(path: &Path) -> Result<SqlitePool> {
@@ -30,7 +31,9 @@ pub async fn connect(path: &Path) -> Result<SqlitePool> {
         .await
         .with_context(|| format!("打开数据库失败: {}", path.display()))?;
 
-    sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await?;
+    sqlx::query("PRAGMA journal_mode = WAL")
+        .execute(&pool)
+        .await?;
     Ok(pool)
 }
 
@@ -50,6 +53,18 @@ fn now() -> String {
 
 /// 插入或更新一条 item，返回其 id。
 pub async fn upsert_item(pool: &SqlitePool, it: &NewItem) -> Result<i64> {
+    Ok(upsert_item_tracked(pool, it).await?.0)
+}
+
+/// 同 [`upsert_item`]，额外返回这次是不是新插入的行。sync 用它区分「新增」和「更新」。
+pub async fn upsert_item_tracked(pool: &SqlitePool, it: &NewItem) -> Result<(i64, bool)> {
+    let existed: Option<(i64,)> =
+        sqlx::query_as("SELECT id FROM item WHERE source = ?1 AND source_id = ?2")
+            .bind(&it.source)
+            .bind(&it.source_id)
+            .fetch_optional(pool)
+            .await?;
+
     let topics = serde_json::to_string(&it.topics)?;
     let raw = serde_json::to_string(&it.raw)?;
 
@@ -92,7 +107,7 @@ pub async fn upsert_item(pool: &SqlitePool, it: &NewItem) -> Result<i64> {
     .await?
     .get("id");
 
-    Ok(id)
+    Ok((id, existed.is_none()))
 }
 
 fn row_to_item(row: &sqlx::sqlite::SqliteRow) -> Result<Item> {
@@ -347,12 +362,11 @@ pub async fn latest_analysis(pool: &SqlitePool, item_id: i64) -> Result<Option<A
 
 /// 取某条 item 的全部分析版本，新的在前。换 prompt / 换模型重跑后用它做对比。
 pub async fn analysis_history(pool: &SqlitePool, item_id: i64) -> Result<Vec<Analysis>> {
-    let rows = sqlx::query(
-        "SELECT * FROM analysis WHERE item_id = ?1 ORDER BY created_at DESC, id DESC",
-    )
-    .bind(item_id)
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query("SELECT * FROM analysis WHERE item_id = ?1 ORDER BY created_at DESC, id DESC")
+            .bind(item_id)
+            .fetch_all(pool)
+            .await?;
     rows.iter().map(row_to_analysis).collect()
 }
 
@@ -382,6 +396,134 @@ pub async fn load_notes(pool: &SqlitePool, item_id: i64) -> Result<Vec<(String, 
     rows.iter()
         .map(|r| Ok((r.try_get("created_at")?, r.try_get("body")?)))
         .collect()
+}
+
+// ---------------------------------------------------------------- sync 游标
+
+#[derive(Debug, Clone, Default)]
+pub struct SyncCursor {
+    pub cursor: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+pub async fn get_sync_cursor(pool: &SqlitePool, source: &str, key: &str) -> Result<SyncCursor> {
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT cursor, completed_at FROM sync_cursor WHERE source = ?1 AND query_key = ?2",
+    )
+    .bind(source)
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row
+        .map(|(cursor, completed_at)| SyncCursor {
+            cursor,
+            completed_at,
+        })
+        .unwrap_or_default())
+}
+
+/// 记下翻到哪了。`completed = true` 表示这个切片已经翻完。
+pub async fn save_sync_cursor(
+    pool: &SqlitePool,
+    source: &str,
+    key: &str,
+    cursor: Option<&str>,
+    completed: bool,
+) -> Result<()> {
+    let at = now();
+    sqlx::query(
+        r#"
+        INSERT INTO sync_cursor (source, query_key, cursor, updated_at, completed_at)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT (source, query_key) DO UPDATE SET
+            cursor       = excluded.cursor,
+            updated_at   = excluded.updated_at,
+            completed_at = excluded.completed_at
+        "#,
+    )
+    .bind(source)
+    .bind(key)
+    .bind(cursor)
+    .bind(&at)
+    .bind(completed.then_some(&at))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------- 浏览视图
+
+/// 全部 item，各自带上最新一次分析的摘要列（analysis 表里冗余存的那几列，不用解析卡片 JSON）。
+pub async fn list_summaries(pool: &SqlitePool) -> Result<Vec<ItemSummary>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT i.*,
+               a.id        AS a_id,
+               a.verdict   AS a_verdict,
+               a.buildable AS a_buildable,
+               a.worth_it  AS a_worth_it,
+               a.reachable AS a_reachable,
+               (SELECT COUNT(*) FROM analysis x WHERE x.item_id = i.id) AS analysis_count,
+               (SELECT COUNT(*) FROM note n WHERE n.item_id = i.id)     AS note_count
+        FROM item i
+        LEFT JOIN analysis a ON a.id = (
+            SELECT id FROM analysis WHERE item_id = i.id ORDER BY created_at DESC, id DESC LIMIT 1
+        )
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.iter()
+        .map(|r| {
+            let tri = |col: &str| -> Result<Option<Tri>> {
+                Ok(r.try_get::<Option<String>, _>(col)?
+                    .as_deref()
+                    .and_then(Tri::parse))
+            };
+            Ok(ItemSummary {
+                item: row_to_item(r)?,
+                latest_analysis_id: r.try_get("a_id")?,
+                verdict: r
+                    .try_get::<Option<String>, _>("a_verdict")?
+                    .as_deref()
+                    .and_then(Verdict::parse),
+                buildable: tri("a_buildable")?,
+                worth_it: tri("a_worth_it")?,
+                reachable: tri("a_reachable")?,
+                analysis_count: r.try_get("analysis_count")?,
+                note_count: r.try_get("note_count")?,
+            })
+        })
+        .collect()
+}
+
+/// 子串匹配的 item id：名称 / tagline / 描述 / 任一版本卡片正文 / 笔记。
+///
+/// 刻意不用 FTS5 的 MATCH：三张 fts 表用的是默认 `unicode61` 分词器，它不切中文 ——
+/// 一整句中文会被当成一个 token，搜「律所」根本命中不了卡片正文。
+/// 自用工具的数据量下 LIKE 全表扫描毫无压力。
+pub async fn item_ids_containing(pool: &SqlitePool, needle: &str) -> Result<Vec<i64>> {
+    let escaped = needle
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%{escaped}%");
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        r#"
+        SELECT id FROM item
+         WHERE name LIKE ?1 ESCAPE '\' OR tagline LIKE ?1 ESCAPE '\' OR description LIKE ?1 ESCAPE '\'
+        UNION
+        SELECT a.item_id FROM analysis a JOIN card_fts c ON c.rowid = a.id
+         WHERE c.card_text LIKE ?1 ESCAPE '\'
+        UNION
+        SELECT item_id FROM note WHERE body LIKE ?1 ESCAPE '\'
+        "#,
+    )
+    .bind(pattern)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
 // ---------------------------------------------------------------- search

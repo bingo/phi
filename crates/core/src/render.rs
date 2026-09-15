@@ -5,7 +5,7 @@
 
 use crate::model::{Analysis, Comment, Item, OpportunityCard, Tri, Verdict};
 
-fn tri_mark(t: Tri) -> &'static str {
+pub fn tri_mark(t: Tri) -> &'static str {
     match t {
         Tri::Yes => "[是]",
         Tri::Unsure => "[存疑]",
@@ -13,7 +13,7 @@ fn tri_mark(t: Tri) -> &'static str {
     }
 }
 
-fn verdict_label(v: Verdict) -> &'static str {
+pub fn verdict_label(v: Verdict) -> &'static str {
     match v {
         Verdict::Follow => "跟进",
         Verdict::Watch => "观望",
@@ -142,7 +142,11 @@ pub fn card_markdown(item: &Item, analysis: &Analysis) -> String {
 
 fn push_evidence(out: &mut String, ev: &[crate::model::Evidence]) {
     for e in ev {
-        out.push_str(&format!("> {}\n>\n> <sub>— {}</sub>\n\n", e.quote.trim(), e.source_ref));
+        out.push_str(&format!(
+            "> {}\n>\n> <sub>— {}</sub>\n\n",
+            e.quote.trim(),
+            e.source_ref
+        ));
     }
 }
 
@@ -150,7 +154,10 @@ fn push_evidence(out: &mut String, ev: &[crate::model::Evidence]) {
 pub fn filter_report(comments: &[Comment]) -> String {
     let total = comments.len();
     let kept = comments.iter().filter(|c| c.kept).count();
-    let mut out = format!("评论 {total} 条，保留 {kept} 条，滤掉 {} 条\n\n", total - kept);
+    let mut out = format!(
+        "评论 {total} 条，保留 {kept} 条，滤掉 {} 条\n\n",
+        total - kept
+    );
 
     let mut by_reason: std::collections::BTreeMap<&str, usize> = Default::default();
     for c in comments.iter().filter(|c| !c.kept) {

@@ -160,8 +160,7 @@ mod tests {
     #[test]
     fn real_template_file_is_valid() {
         // 仓库里那份模板必须始终可解析 —— 改坏了这里会先炸，而不是等到线上调用。
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../prompts/card.v1.md");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../prompts/card.v1.md");
         let t = PromptTemplate::load(&path).expect("prompts/card.v1.md 解析失败");
         assert_eq!(t.version, "v1");
         let rendered = t.render_user(&input());

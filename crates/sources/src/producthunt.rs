@@ -262,8 +262,18 @@ fn post_by_id_query() -> String {
 /// `topic` / `postedAfter` / `postedBefore` 内联进查询串而不是声明成 GraphQL 变量 ——
 /// 这几个参数的 scalar 类型名不好确定，内联成字面量可以避开声明，出错时也更好改。
 /// `order` 刻意不传：枚举值名不确定，默认排序够用。
+/// PH 列表接口单页最多返回 20 条，`first` 传再大也会被截断（2026-09-15 实测）。
+const POSTS_PAGE_SIZE: u32 = 20;
+
+/// 固定 `order: NEWEST`：实测同一天的数据连续两次翻页，NEWEST 顺序完全一致、无重复；
+/// VOTES 在票数相同的条目之间会乱序，60 个位置里只有 58 个不重复 —— 偏移量分页会跳条。
+/// 不传 order 时默认是 RANKING，会把当天的产品排在最前。
 fn posts_query(q: &ListQuery) -> String {
-    let mut args = vec!["first: 50".to_string(), "after: $after".to_string()];
+    let mut args = vec![
+        format!("first: {POSTS_PAGE_SIZE}"),
+        "after: $after".to_string(),
+        "order: NEWEST".to_string(),
+    ];
     if let Some(t) = &q.topic {
         args.push(format!("topic: {}", json!(t)));
     }
@@ -815,11 +825,15 @@ mod tests {
     fn posts_query_inlines_optional_args() {
         let q = ListQuery {
             topic: Some("artificial-intelligence".into()),
-            limit: 10,
             ..Default::default()
         };
         let s = posts_query(&q);
         assert!(s.contains(r#"topic: "artificial-intelligence""#));
         assert!(!s.contains("postedAfter"));
+        assert!(
+            s.contains("order: NEWEST"),
+            "不传 order 会退回 RANKING，按天续传会跳条"
+        );
+        assert!(s.contains("first: 20"));
     }
 }

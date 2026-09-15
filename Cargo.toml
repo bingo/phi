@@ -11,7 +11,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.86"
 license = "MIT"
 
 [workspace.dependencies]
@@ -41,6 +41,9 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 regex = "1"
+# TUI。rendered-line-info 用来算自动换行后的总行数，给卡片 / 笔记栏的滚动做边界
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+ratatui-textarea = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"

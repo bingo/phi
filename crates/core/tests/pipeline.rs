@@ -172,9 +172,13 @@ impl Analyzer for FakeAnalyzer {
 // ---------------------------------------------------------------- 测试
 
 async fn ctx() -> (Ctx, std::path::PathBuf) {
+    // 光靠时间戳不够：macOS 的时钟只有微秒精度，并行跑的测试会拿到同一个文件名，
+    // 然后在同一个库上重复跑 migration。加一个进程内计数器保证唯一。
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
-        "phi-test-{}-{}.db",
+        "phi-test-{}-{}-{}.db",
         std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -189,10 +193,14 @@ async fn ctx() -> (Ctx, std::path::PathBuf) {
 async fn full_pipeline() {
     let (ctx, path) = ctx().await;
 
-    let (item, analysis) =
-        usecase::ingest_url(&ctx, &FakeSource, &FakeAnalyzer, "https://fake.test/posts/acme")
-            .await
-            .expect("ingest 失败");
+    let (item, analysis) = usecase::ingest_url(
+        &ctx,
+        &FakeSource,
+        &FakeAnalyzer,
+        "https://fake.test/posts/acme",
+    )
+    .await
+    .expect("ingest 失败");
 
     assert_eq!(item.name, "Acme");
     assert_eq!(item.topics, vec!["productivity", "saas"]);
@@ -237,10 +245,14 @@ async fn full_pipeline() {
 async fn reanalyze_appends_and_keeps_history() {
     let (ctx, path) = ctx().await;
 
-    let (item, first) =
-        usecase::ingest_url(&ctx, &FakeSource, &FakeAnalyzer, "https://fake.test/posts/acme")
-            .await
-            .unwrap();
+    let (item, first) = usecase::ingest_url(
+        &ctx,
+        &FakeSource,
+        &FakeAnalyzer,
+        "https://fake.test/posts/acme",
+    )
+    .await
+    .unwrap();
 
     // 重跑：应当**追加**而不是覆盖 —— 没有历史就没法 diff
     let second = usecase::reanalyze(&ctx, &FakeAnalyzer, first.id)
@@ -270,10 +282,14 @@ async fn reanalyze_appends_and_keeps_history() {
 #[tokio::test]
 async fn notes_are_independent_of_analysis() {
     let (ctx, path) = ctx().await;
-    let (item, analysis) =
-        usecase::ingest_url(&ctx, &FakeSource, &FakeAnalyzer, "https://fake.test/posts/acme")
-            .await
-            .unwrap();
+    let (item, analysis) = usecase::ingest_url(
+        &ctx,
+        &FakeSource,
+        &FakeAnalyzer,
+        "https://fake.test/posts/acme",
+    )
+    .await
+    .unwrap();
 
     usecase::add_note(&ctx, item.id, "我觉得这个方向的真问题是获客")
         .await
@@ -361,6 +377,509 @@ async fn analyze_refuses_when_no_comments_survive() {
     assert!(
         err.to_string().contains("没有通过过滤的评论"),
         "错误信息应当解释为什么拒绝: {err}"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn overview_filters_sorts_and_searches() {
+    let (ctx, path) = ctx().await;
+
+    // A：走完整管线，有分析（watch / 能做 yes / 值得 unsure / 触达 no），3 条评论
+    let (a, _) = usecase::ingest_url(
+        &ctx,
+        &FakeSource,
+        &FakeAnalyzer,
+        "https://fake.test/posts/acme",
+    )
+    .await
+    .unwrap();
+    // B：只入库没分析，评论更多
+    let b_id = db::upsert_item(
+        &ctx.db,
+        &NewItem {
+            source: "fake".into(),
+            source_id: "p2".into(),
+            slug: Some("zeta".into()),
+            url: "https://fake.test/posts/zeta".into(),
+            name: "Zeta".into(),
+            tagline: Some("100% offline notes".into()),
+            description: None,
+            website: None,
+            posted_at: Some("2026-09-10T00:00:00Z".into()),
+            signal_count: 50,
+            vote_count: 10,
+            topics: vec![],
+            raw: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    usecase::add_note(&ctx, b_id, "真问题是获客").await.unwrap();
+
+    let names = |o: &Overview| {
+        o.rows
+            .iter()
+            .map(|r| r.item.name.clone())
+            .collect::<Vec<_>>()
+    };
+    let run = |q: OverviewQuery| {
+        let ctx = &ctx;
+        async move { usecase::overview(ctx, &q).await.unwrap() }
+    };
+
+    // 默认：全部，按评论数降序
+    let all = run(OverviewQuery::default()).await;
+    assert_eq!(all.total, 2);
+    assert_eq!(names(&all), ["Zeta", "Acme"]);
+    let acme = &all.rows[1];
+    assert_eq!(acme.verdict, Some(Verdict::Watch));
+    assert_eq!(acme.buildable, Some(Tri::Yes));
+    assert_eq!(acme.analysis_count, 1);
+    assert_eq!(all.rows[0].note_count, 1);
+    assert!(all.rows[0].latest_analysis_id.is_none());
+
+    // 分析状态
+    let q = |f: fn(&mut OverviewQuery)| {
+        let mut q = OverviewQuery::default();
+        f(&mut q);
+        q
+    };
+    assert_eq!(
+        names(&run(q(|q| q.state = AnalysisState::Pending)).await),
+        ["Zeta"]
+    );
+    assert_eq!(
+        names(&run(q(|q| q.state = AnalysisState::Analyzed)).await),
+        ["Acme"]
+    );
+
+    // 结论和三轴：「能做但卖不出去」这种组合必须能筛出来
+    assert_eq!(
+        names(&run(q(|q| q.verdict = Some(Verdict::Watch))).await),
+        ["Acme"]
+    );
+    assert!(run(q(|q| q.verdict = Some(Verdict::Follow)))
+        .await
+        .rows
+        .is_empty());
+    assert_eq!(
+        names(
+            &run(q(|q| {
+                q.buildable = Some(Tri::Yes);
+                q.reachable = Some(Tri::No);
+            }))
+            .await
+        ),
+        ["Acme"]
+    );
+    assert!(run(q(|q| q.worth_it = Some(Tri::Yes)))
+        .await
+        .rows
+        .is_empty());
+
+    // 阈值
+    assert_eq!(names(&run(q(|q| q.min_signal = 10)).await), ["Zeta"]);
+
+    // 搜索：中文子串要能命中卡片正文和笔记（FTS5 默认分词器做不到这点）
+    let search = |t: &'static str| q_text(t);
+    assert_eq!(names(&run(search("数据导出")).await), ["Acme"]);
+    assert_eq!(names(&run(search("获客")).await), ["Zeta"]);
+    assert_eq!(
+        names(&run(search("acme")).await),
+        ["Acme"],
+        "ASCII 应当大小写不敏感"
+    );
+    // LIKE 通配符要被转义：「100%」只该命中字面量
+    assert_eq!(names(&run(search("100%")).await), ["Zeta"]);
+    assert!(run(search("0%o")).await.rows.is_empty(), "% 没被转义");
+
+    // 排序
+    assert_eq!(
+        names(&run(q(|q| q.sort = SortKey::Name)).await),
+        ["Acme", "Zeta"]
+    );
+    assert_eq!(
+        names(&run(q(|q| q.sort = SortKey::Votes)).await),
+        ["Acme", "Zeta"]
+    );
+    assert_eq!(
+        names(&run(q(|q| q.sort = SortKey::Newest)).await),
+        ["Zeta", "Acme"]
+    );
+
+    // 详情：分析和笔记并排，但互不相干
+    let d = usecase::item_detail(&ctx, a.id).await.unwrap();
+    assert_eq!(d.analyses.len(), 1);
+    assert!(d.notes.is_empty());
+    assert_eq!(
+        usecase::item_detail(&ctx, b_id).await.unwrap().notes.len(),
+        1
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+fn q_text(t: &str) -> OverviewQuery {
+    OverviewQuery {
+        text: Some(t.into()),
+        ..Default::default()
+    }
+}
+
+// ---------------------------------------------------------------- sync
+
+/// 按天分页的假数据源：每天若干条，每页 2 条，游标 = 偏移量（和 PH 一样）。
+struct PagedSource {
+    /// (UTC 日期, 当天条数)
+    days: Vec<(chrono::NaiveDate, usize)>,
+    calls: std::sync::Mutex<Vec<(chrono::NaiveDate, usize)>>,
+    /// 第 N 次调用时报错（模拟网络中断），None 表示不报错
+    fail_on_call: Option<usize>,
+}
+
+impl PagedSource {
+    fn new(days: Vec<(chrono::NaiveDate, usize)>) -> Self {
+        Self {
+            days,
+            calls: Default::default(),
+            fail_on_call: None,
+        }
+    }
+    fn calls(&self) -> Vec<(chrono::NaiveDate, usize)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Source for PagedSource {
+    fn id(&self) -> &'static str {
+        "paged"
+    }
+    fn matches_url(&self, _u: &str) -> bool {
+        false
+    }
+    fn parse_url(&self, _u: &str) -> Result<ItemKey> {
+        unreachable!()
+    }
+    async fn list(&self, q: &ListQuery, cursor: Option<&str>) -> Result<Page<NewItem>> {
+        let day = q.posted_after.expect("sync 必须按天切片").date_naive();
+        assert_eq!(
+            q.posted_before.unwrap() - q.posted_after.unwrap(),
+            chrono::Duration::days(1),
+            "切片应当正好一天"
+        );
+        let offset: usize = cursor.map(|c| c.parse().unwrap()).unwrap_or(0);
+        let n_call = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push((day, offset));
+            calls.len()
+        };
+        if self.fail_on_call == Some(n_call) {
+            anyhow::bail!("模拟网络中断");
+        }
+        let total = self
+            .days
+            .iter()
+            .find(|(d, _)| *d == day)
+            .map_or(0, |(_, n)| *n);
+        let end = (offset + 2).min(total);
+        let items = (offset..end)
+            .map(|i| NewItem {
+                source: "paged".into(),
+                source_id: format!("{day}-{i}"),
+                slug: None,
+                url: format!("https://paged.test/{day}/{i}"),
+                name: format!("{day} #{i}"),
+                tagline: None,
+                description: None,
+                website: None,
+                posted_at: Some(format!("{day}T07:01:00Z")),
+                signal_count: i as i64,
+                vote_count: 0,
+                topics: vec![],
+                raw: serde_json::json!({}),
+            })
+            .collect();
+        Ok(Page {
+            items,
+            next_cursor: (end < total).then(|| end.to_string()),
+        })
+    }
+    async fn fetch_one(&self, _k: &ItemKey) -> Result<NewItem> {
+        unreachable!()
+    }
+    async fn fetch_discussion(&self, _k: &ItemKey) -> Result<Vec<NewComment>> {
+        unreachable!()
+    }
+}
+
+fn day(s: &str) -> chrono::NaiveDate {
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+}
+
+fn sync_req(since: &str, until: &str) -> SyncRequest {
+    SyncRequest {
+        topic: None,
+        since: day(since),
+        until: day(until),
+        max_pages: None,
+        refresh: false,
+    }
+}
+
+async fn item_count(ctx: &Ctx) -> i64 {
+    sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM item")
+        .fetch_one(&ctx.db)
+        .await
+        .unwrap()
+        .0
+}
+
+#[tokio::test]
+async fn sync_slices_by_day_and_resumes_after_budget_runs_out() {
+    let (ctx, path) = ctx().await;
+    // 两个已经结束的日子：5 条 = 3 页，3 条 = 2 页
+    let src = PagedSource::new(vec![(day("2026-09-01"), 5), (day("2026-09-02"), 3)]);
+
+    // 第一次只给 2 页预算：9-01 翻到一半就停
+    let r = usecase::sync(
+        &ctx,
+        &src,
+        &SyncRequest {
+            max_pages: Some(2),
+            ..sync_req("2026-09-01", "2026-09-02")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(r.budget_exhausted);
+    assert_eq!(
+        (r.pages, r.inserted, r.updated, r.days_completed),
+        (2, 4, 0, 0)
+    );
+    assert_eq!(
+        (r.days, r.days_pending()),
+        (2, 2),
+        "没轮到的日子也要算进范围"
+    );
+
+    // 第二次不限预算：9-01 从偏移 4 续传，然后拉完 9-02
+    let r = usecase::sync(&ctx, &src, &sync_req("2026-09-01", "2026-09-02"))
+        .await
+        .unwrap();
+    assert!(!r.budget_exhausted);
+    assert_eq!(r.days_completed, 2);
+    assert_eq!(
+        (r.pages, r.inserted, r.updated),
+        (3, 4, 0),
+        "续传不应重拉已拉过的页"
+    );
+    assert_eq!(
+        src.calls(),
+        vec![
+            (day("2026-09-01"), 0),
+            (day("2026-09-01"), 2),
+            (day("2026-09-01"), 4), // ← 续传点
+            (day("2026-09-02"), 0),
+            (day("2026-09-02"), 2),
+        ]
+    );
+    assert_eq!(item_count(&ctx).await, 8);
+
+    // 预算在 9-01 用完时，排在后面、之前已完成的 9-02 应该算「跳过」而不是「未拉完」
+    let r = usecase::sync(
+        &ctx,
+        &src,
+        &SyncRequest {
+            max_pages: Some(0),
+            refresh: false,
+            ..sync_req("2026-08-31", "2026-09-02")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(r.budget_exhausted);
+    assert_eq!(
+        (r.days, r.days_skipped, r.days_pending(), r.pages),
+        (3, 2, 1, 0)
+    );
+
+    // 第三次：两天都已完成，一个请求都不发
+    let r = usecase::sync(&ctx, &src, &sync_req("2026-09-01", "2026-09-02"))
+        .await
+        .unwrap();
+    assert_eq!((r.pages, r.days_skipped, r.days), (0, 2, 2));
+
+    // --refresh：从头重拉，全部算「更新」而不是「新增」
+    let r = usecase::sync(
+        &ctx,
+        &src,
+        &SyncRequest {
+            refresh: true,
+            ..sync_req("2026-09-01", "2026-09-02")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (r.pages, r.inserted, r.updated, r.days_completed),
+        (5, 0, 8, 2)
+    );
+    assert_eq!(item_count(&ctx).await, 8);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn sync_never_marks_an_unfinished_day_complete() {
+    let (ctx, path) = ctx().await;
+    let today = chrono::Utc::now().date_naive();
+    let src = PagedSource::new(vec![(today, 3)]);
+    let req = SyncRequest {
+        topic: None,
+        since: today,
+        until: today,
+        max_pages: None,
+        refresh: false,
+    };
+
+    let r = usecase::sync(&ctx, &src, &req).await.unwrap();
+    assert_eq!((r.days_open, r.days_completed, r.inserted), (1, 0, 3));
+
+    // 再跑一次：今天还没结束，必须从头再拉（新发布的产品会把偏移量往后推，续传不可靠）
+    let r = usecase::sync(&ctx, &src, &req).await.unwrap();
+    assert_eq!(
+        (r.days_open, r.days_skipped, r.pages, r.updated),
+        (1, 0, 2, 3)
+    );
+    assert_eq!(src.calls().iter().filter(|(_, off)| *off == 0).count(), 2);
+
+    // 中途被预算打断也不留游标
+    let src2 = PagedSource::new(vec![(today, 3)]);
+    usecase::sync(
+        &ctx,
+        &src2,
+        &SyncRequest {
+            max_pages: Some(1),
+            ..req.clone()
+        },
+    )
+    .await
+    .unwrap();
+    usecase::sync(&ctx, &src2, &req).await.unwrap();
+    assert_eq!(src2.calls()[1], (today, 0), "当天不应续传");
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn sync_keeps_progress_when_a_request_fails() {
+    let (ctx, path) = ctx().await;
+    let mut src = PagedSource::new(vec![(day("2026-09-01"), 6)]);
+    src.fail_on_call = Some(2);
+
+    let err = usecase::sync(&ctx, &src, &sync_req("2026-09-01", "2026-09-01"))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("重跑会续传"), "{err:#}");
+    assert_eq!(item_count(&ctx).await, 2, "失败前那一页已经入库");
+
+    // 重跑：从偏移 2 接着拉
+    src.fail_on_call = None;
+    let r = usecase::sync(&ctx, &src, &sync_req("2026-09-01", "2026-09-01"))
+        .await
+        .unwrap();
+    assert_eq!((r.inserted, r.days_completed), (4, 1));
+    assert_eq!(src.calls().last().unwrap(), &(day("2026-09-01"), 4));
+    assert_eq!(
+        src.calls()[2],
+        (day("2026-09-01"), 2),
+        "应当从失败的那页重试"
+    );
+
+    // topic 不同是另一个切片：按 topic 拉完不代表全量拉完
+    let r = usecase::sync(
+        &ctx,
+        &src,
+        &SyncRequest {
+            topic: Some("ai".into()),
+            ..sync_req("2026-09-01", "2026-09-01")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!((r.days_skipped, r.days_completed), (0, 1));
+
+    // 日期写反要报错
+    assert!(
+        usecase::sync(&ctx, &src, &sync_req("2026-09-02", "2026-09-01"))
+            .await
+            .is_err()
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+// ---------------------------------------------------------------- analyze_item
+
+#[tokio::test]
+async fn analyze_item_fetches_comments_first_when_missing() {
+    let (ctx, path) = ctx().await;
+    // 模拟 sync 入库：只有元数据，没抓评论
+    let item_id = db::upsert_item(
+        &ctx.db,
+        &FakeSource
+            .fetch_one(&ItemKey::Slug("acme".into()))
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let stages = std::sync::Mutex::new(Vec::new());
+    let record = |s: usecase::AnalyzeStage| stages.lock().unwrap().push(s);
+
+    // 没有信息源又没抓过评论：说清楚缺什么，而不是报「没有评论」
+    let err = usecase::analyze_item(&ctx, None, &FakeAnalyzer, item_id, &record)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("还没抓过评论"), "{err:#}");
+    assert!(stages.lock().unwrap().is_empty());
+
+    // 有信息源：先抓评论，再调模型
+    let a1 = usecase::analyze_item(&ctx, Some(&FakeSource), &FakeAnalyzer, item_id, &record)
+        .await
+        .unwrap();
+    assert_eq!(
+        *stages.lock().unwrap(),
+        [
+            usecase::AnalyzeStage::FetchingComments,
+            usecase::AnalyzeStage::CallingModel
+        ]
+    );
+    assert_eq!(
+        db::load_comments(&ctx.db, item_id, false)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+
+    // 评论已经抓过：不再抓，也不需要信息源；追加新版本
+    stages.lock().unwrap().clear();
+    let a2 = usecase::analyze_item(&ctx, None, &FakeAnalyzer, item_id, &record)
+        .await
+        .unwrap();
+    assert_eq!(
+        *stages.lock().unwrap(),
+        [usecase::AnalyzeStage::CallingModel]
+    );
+    assert_ne!(a1.id, a2.id);
+    assert_eq!(
+        db::analysis_history(&ctx.db, item_id).await.unwrap().len(),
+        2
     );
 
     let _ = std::fs::remove_file(path);

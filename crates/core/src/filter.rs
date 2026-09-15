@@ -81,10 +81,7 @@ impl CommentFilter {
 
     /// 返回与输入等长、顺序一致的判定结果。
     pub fn apply<T: Filterable>(&self, comments: &[T]) -> Vec<Decision> {
-        let mut decisions: Vec<Decision> = comments
-            .iter()
-            .map(|c| self.judge_one(c))
-            .collect();
+        let mut decisions: Vec<Decision> = comments.iter().map(|c| self.judge_one(c)).collect();
 
         // top_n 截断：在通过前置规则的那批里按票数降序取前 N。
         if self.cfg.top_n > 0 {

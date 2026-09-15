@@ -75,7 +75,7 @@ phi reanalyze <analysis_id> --model <更强的模型> --diff
 
 ```
 phi add <url>              主循环：抓取 → 评论 → 过滤 → 分析 → 打印卡片
-phi sync --topic ai --since 2026-09-01     阶段一：批量拉轻量元数据入库
+phi sync --since 2026-09-01 [--until 2026-09-14] [--max-pages 30]   阶段一：按天批量拉轻量元数据，中断后重跑会续传
 phi hydrate --min-comments 15              阶段二：给候选拉评论
 phi analyze <item_id>
 phi reanalyze <analysis_id> --diff
@@ -86,6 +86,7 @@ phi note <item_id> "..."
 phi search "<query>"
 phi filtered <item_id>     看评论过滤结果，抽查误杀率
 phi schema                 打印发给模型的 JSON Schema
+phi tui --min-comments 15  三栏浏览：左列表（可筛可排）、中卡片、右笔记。进去按 ? 看按键
 ```
 
 ---
@@ -93,8 +94,8 @@ phi schema                 打印发给模型的 JSON Schema
 ## 两件容易忘的事
 
 **采集是两阶段的，动机是 PH 的配额不是模型成本。**
-PH 限流按复杂度算（6250 points / 15 分钟，嵌套连接会相乘），
-`posts(first:50){comments(first:30)}` 会迅速烧光额度。所以 `sync` 只拉轻量元数据，
+PH 每个请求固定扣 100 点（6250 点 / 15 分钟，被拒的请求也扣），另有单查询复杂度上限，嵌套连接相乘。
+一天大约 700+ 条发布、每页最多 20 条，拉一天就要 35+ 个请求。所以 `sync` 只拉轻量元数据，
 `hydrate` 只对候选拉评论。模型那边一张卡约 0.2-0.3 美分，可以忽略。
 
 **笔记和 AI 分析是两条完全独立的线。**

@@ -3,14 +3,17 @@
 //! 所有子命令都是 `phi_core::usecase` 里函数的薄包装。业务流程不写在这里。
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{NaiveDate, Utc};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use phi_analyzer::OpenRouterAnalyzer;
-use phi_core::model::ListQuery;
+use phi_core::model::SyncRequest;
 use phi_core::{config::Config, db, render, usecase, Ctx};
 use phi_sources::ProductHunt;
+
+mod tui;
 
 #[derive(Parser)]
 #[command(
@@ -43,17 +46,22 @@ enum Cmd {
         url: String,
     },
 
-    /// 阶段一：按分类/日期批量拉轻量元数据入库（不碰评论、不做分析）
+    /// 阶段一：按天批量拉轻量元数据入库（不碰评论、不做分析）。中断后重跑会续传
     Sync {
         #[arg(long)]
         topic: Option<String>,
-        /// 起始日期，形如 2026-09-01
+        /// 起始日期（UTC），形如 2026-09-01。默认今天
         #[arg(long)]
         since: Option<String>,
+        /// 结束日期（UTC，含当天）。默认今天
         #[arg(long)]
         until: Option<String>,
-        #[arg(long, default_value_t = 200)]
-        limit: usize,
+        /// 本次最多发多少个请求（每个 20 条、扣 100 点配额）。用完就停，下次续传。默认不限
+        #[arg(long)]
+        max_pages: Option<usize>,
+        /// 忽略已完成标记，从头重拉（用来刷新旧日期的票数和评论数）
+        #[arg(long)]
+        refresh: bool,
     },
 
     /// 阶段二：对通过阈值的候选拉评论
@@ -111,20 +119,30 @@ enum Cmd {
 
     /// 打印发给模型的 JSON Schema（调试用）
     Schema,
+
+    /// 三栏浏览：左列表（可筛可排）、中卡片、右笔记。按 ? 看按键
+    Tui {
+        /// 评论数阈值的初始值，进去之后用 +/- 调
+        #[arg(long, default_value_t = 0)]
+        min_comments: i64,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| cli.log.clone().into()),
-        )
-        .with_target(false)
-        .without_time()
-        .init();
+    // TUI 占着整个终端，日志打出来会把界面写花 —— 那个模式下不装 subscriber
+    if !matches!(cli.cmd, Cmd::Tui { .. }) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| cli.log.clone().into()),
+            )
+            .with_target(false)
+            .without_time()
+            .init();
+    }
 
     // schema 是纯本地操作，不需要配置和数据库
     if let Cmd::Schema = cli.cmd {
@@ -140,6 +158,19 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Schema => unreachable!(),
 
+        Cmd::Tui { min_comments } => {
+            // 缺 key 不影响浏览，只在按 a 分析时提示
+            let backends = tui::Backends {
+                source: build_source(&ctx)
+                    .map(|s| Arc::new(s) as Arc<dyn phi_core::Source>)
+                    .map_err(|e| format!("{e:#}")),
+                analyzer: build_analyzer(&ctx, cli.model.clone())
+                    .map(|a| Arc::new(a) as Arc<dyn phi_core::Analyzer>)
+                    .map_err(|e| format!("{e:#}")),
+            };
+            tui::run(&ctx, min_comments, backends).await?
+        }
+
         Cmd::Add { url } => {
             let source = build_source(&ctx)?;
             let analyzer = build_analyzer(&ctx, cli.model)?;
@@ -151,18 +182,50 @@ async fn main() -> Result<()> {
             topic,
             since,
             until,
-            limit,
+            max_pages,
+            refresh,
         } => {
             let source = build_source(&ctx)?;
-            let q = ListQuery {
+            let today = Utc::now().date_naive();
+            let req = SyncRequest {
                 topic,
-                posted_after: since.as_deref().map(parse_date).transpose()?,
-                posted_before: until.as_deref().map(parse_date).transpose()?,
-                limit,
+                since: since
+                    .as_deref()
+                    .map(parse_day)
+                    .transpose()?
+                    .unwrap_or(today),
+                until: until
+                    .as_deref()
+                    .map(parse_day)
+                    .transpose()?
+                    .unwrap_or(today),
+                max_pages,
+                refresh,
             };
-            let n = usecase::sync(&ctx, &source, &q).await?;
-            println!("入库 {n} 条。");
-            println!("下一步：phi ls --min-comments 15 挑候选，再 phi hydrate 拉评论。");
+            let r = usecase::sync(&ctx, &source, &req).await?;
+            println!(
+                "{} 天：新完成 {}，跳过（之前已拉完）{}，已拉但当天未结束 {}，未拉完 {}。",
+                r.days,
+                r.days_completed,
+                r.days_skipped,
+                r.days_open,
+                r.days_pending()
+            );
+            println!(
+                "请求 {} 次，处理 {} 条：新增 {}，更新 {}。",
+                r.pages,
+                r.inserted + r.updated,
+                r.inserted,
+                r.updated
+            );
+            if r.budget_exhausted {
+                println!(
+                    "已用完 --max-pages。已结束日期的进度已保存，重跑同一条命令会接着拉；\
+                     还没结束的日期（今天）不存进度，下次从头拉。"
+                );
+            } else {
+                println!("下一步：phi ls --min-comments 15 挑候选，再 phi hydrate 拉评论。");
+            }
         }
 
         Cmd::Hydrate {
@@ -268,7 +331,12 @@ async fn main() -> Result<()> {
                 println!("没有命中。");
             }
             for it in items {
-                println!("{:>5}  {}  —  {}", it.id, it.name, it.tagline.unwrap_or_default());
+                println!(
+                    "{:>5}  {}  —  {}",
+                    it.id,
+                    it.name,
+                    it.tagline.unwrap_or_default()
+                );
             }
         }
 
@@ -304,8 +372,7 @@ fn build_analyzer(ctx: &Ctx, model_override: Option<String>) -> Result<OpenRoute
     OpenRouterAnalyzer::new(&ctx.config.analyzer, key, model_override)
 }
 
-fn parse_date(s: &str) -> Result<DateTime<Utc>> {
-    let d = NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .with_context(|| format!("日期格式应为 YYYY-MM-DD，收到: {s}"))?;
-    Ok(Utc.from_utc_datetime(&d.and_hms_opt(0, 0, 0).unwrap()))
+fn parse_day(s: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .with_context(|| format!("日期格式应为 YYYY-MM-DD，收到: {s}"))
 }

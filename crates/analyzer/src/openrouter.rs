@@ -36,7 +36,11 @@ pub struct OpenRouterAnalyzer {
 }
 
 impl OpenRouterAnalyzer {
-    pub fn new(cfg: &AnalyzerConfig, api_key: String, model_override: Option<String>) -> Result<Self> {
+    pub fn new(
+        cfg: &AnalyzerConfig,
+        api_key: String,
+        model_override: Option<String>,
+    ) -> Result<Self> {
         let template = PromptTemplate::load(&cfg.prompt_path)?;
         Ok(Self {
             http: reqwest::Client::builder()
@@ -120,7 +124,10 @@ impl Analyzer for OpenRouterAnalyzer {
 
         let resp = self
             .http
-            .post(format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/chat/completions",
+                self.cfg.base_url.trim_end_matches('/')
+            ))
             .bearer_auth(&self.api_key)
             .header("X-Title", "phi")
             .json(&body)
@@ -164,14 +171,13 @@ impl Analyzer for OpenRouterAnalyzer {
             .and_then(|m| m.content)
             .ok_or_else(|| anyhow!("OpenRouter 返回的 message 没有 content"))?;
 
-        let card: OpportunityCard = serde_json::from_str(content.trim())
-            .with_context(|| {
-                format!(
-                    "模型输出解析成 OpportunityCard 失败。\n\
+        let card: OpportunityCard = serde_json::from_str(content.trim()).with_context(|| {
+            format!(
+                "模型输出解析成 OpportunityCard 失败。\n\
                      开了严格模式还出现这种情况，通常说明请求被路由到了不支持 \
                      json_schema 的 provider。\n原始输出：\n{content}"
-                )
-            })?;
+            )
+        })?;
 
         let usage = Usage {
             tokens_in: parsed.usage.as_ref().and_then(|u| u.prompt_tokens),

@@ -20,7 +20,8 @@ pub mod usecase;
 pub use config::Config;
 pub use ports::{Analyzer, Source};
 
-/// 用例层共享的运行期上下文。
+/// 用例层共享的运行期上下文。`Clone` 很便宜（连接池内部是 Arc），后台任务各持一份。
+#[derive(Clone)]
 pub struct Ctx {
     pub config: Config,
     pub db: sqlx::SqlitePool,

@@ -245,3 +245,13 @@ tmux 在库副本上真实跑：TryCase（#312，未抓评论）按 `a` → `y`�
 - 退出时正在跑的分析会被直接中断，不会等它写完（模型费用已花）
 - 没有取消单个任务的按键
 - 分析不能在 TUI 里换 prompt 或用同一快照重跑（`phi reanalyze`），只能追加基于当前评论的新版本
+
+---
+
+## 🟢 HANDOFF.md 里的文件清单还指着旧的 README
+
+2026-09-16 拆文档：原 `README.md` 整篇改名成 `MANUAL.md`，新写的 `README.md` 只留目标、
+编译安装、命令行用法和两张 TUI 截图。`HANDOFF.md` 第 6 行和第 93 行的表格还按旧结构描述
+（「README.md —— 怎么跑起来、命令速查」「138 行」），下次动 HANDOFF 时顺手改掉。
+
+`scripts/dbsync.sh` 里那条「见 README」的注释已经改成 MANUAL.md。

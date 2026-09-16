@@ -13,6 +13,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # 必须先编译：迁移 SQL 是被 sqlx::migrate! 编译进二进制的，
-# 改了 migrations/ 下的文件却跑旧二进制，会把目标库搞成半成品状态（见 README）
+# 改了 migrations/ 下的文件却跑旧二进制，会把目标库搞成半成品状态（见 MANUAL.md）
 cargo build --release --bin phi
 exec ./target/release/phi dbsync "$@"

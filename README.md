@@ -1,3 +1,5 @@
+<img src="docs/logo/phi-128.png" alt="phi" width="80">
+
 # phi
 
 **ph**oduct**h**unt **i**nspiration tool —— 把 ProductHunt 上有真实用户讨论的产品，

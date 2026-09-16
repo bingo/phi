@@ -3,8 +3,22 @@
 #   PHI_ANALYZER__MODEL="deepseek/deepseek-v4.1-flash"
 
 [db]
+# "sqlite"（默认，单文件零运维）或 "mysql"
+backend = "sqlite"
+
+# --- backend = "sqlite" ---
 # 相对路径按当前工作目录解析
 path = "phi.db"
+
+# --- backend = "mysql" ---
+# DSN 带密码，所以更推荐留空 url、改用 url_env 指向一个环境变量。
+# 库不存在会尝试自动创建；建表时显式指定了 utf8mb4，不依赖服务器默认字符集
+# （MySQL 5.7 的默认是 latin1，中文和 emoji 会被吃掉）。
+# url = "mysql://phi:secret@127.0.0.1:3306/phi"
+url_env = "PHI_DB_URL"
+
+# 连接池上限。两个后端共用
+max_connections = 4
 
 [producthunt]
 # https://www.producthunt.com/v2/oauth/applications 里生成 Developer Token

@@ -20,16 +20,73 @@ pub struct Config {
     pub comment_filter: CommentFilterConfig,
 }
 
+/// 存储后端。默认 SQLite —— 单文件、零运维，换 MySQL 只是配置的事。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DbBackend {
+    #[default]
+    Sqlite,
+    Mysql,
+}
+
+impl DbBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DbBackend::Sqlite => "sqlite",
+            DbBackend::Mysql => "mysql",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbConfig {
+    /// `"sqlite"`（默认）或 `"mysql"`。
+    #[serde(default)]
+    pub backend: DbBackend,
+    /// SQLite 的数据库文件。相对路径按当前工作目录解析。backend = mysql 时忽略。
     pub path: PathBuf,
+    /// MySQL 的 DSN：`mysql://user:pass@host:3306/phi`。
+    /// 留空则读 `url_env` 指向的环境变量 —— DSN 带密码，优先用环境变量。
+    #[serde(default)]
+    pub url: String,
+    /// 存 MySQL DSN 的环境变量名。只在 `url` 为空时生效。
+    #[serde(default = "default_url_env")]
+    pub url_env: String,
+    pub max_connections: u32,
+}
+
+fn default_url_env() -> String {
+    "PHI_DB_URL".into()
 }
 
 impl Default for DbConfig {
     fn default() -> Self {
         Self {
+            backend: DbBackend::default(),
             path: PathBuf::from("phi.db"),
+            url: String::new(),
+            url_env: default_url_env(),
+            max_connections: 4,
         }
+    }
+}
+
+impl DbConfig {
+    /// MySQL 的 DSN。`url` 优先，否则读 `url_env`。
+    ///
+    /// 两个都空时给的是**可操作**的错误 —— 配错数据库连接是最容易发生、
+    /// 也最容易被一句「connection refused」糊过去的一类失败。
+    pub fn resolve_mysql_url(&self) -> Result<String> {
+        if !self.url.trim().is_empty() {
+            return Ok(self.url.trim().to_string());
+        }
+        std::env::var(&self.url_env).with_context(|| {
+            format!(
+                "[db] backend = \"mysql\" 但没有 DSN：config.toml 里填 url，\n\
+                 或者 export {}=mysql://user:pass@host:3306/phi",
+                self.url_env
+            )
+        })
     }
 }
 

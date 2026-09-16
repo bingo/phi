@@ -106,11 +106,10 @@ pub async fn reanalyze(ctx: &Ctx, analyzer: &dyn Analyzer, analysis_id: i64) -> 
         .await?
         .ok_or_else(|| anyhow!("找不到 analysis {analysis_id}"))?;
 
-    let row: (String,) = sqlx::query_as("SELECT input_snapshot FROM analysis WHERE id = ?1")
-        .bind(analysis_id)
-        .fetch_one(&ctx.db)
-        .await?;
-    let input: AnalysisInput = serde_json::from_str(&row.0)?;
+    let snapshot = db::get_input_snapshot(&ctx.db, analysis_id)
+        .await?
+        .ok_or_else(|| anyhow!("analysis {analysis_id} 没有输入快照"))?;
+    let input: AnalysisInput = serde_json::from_str(&snapshot)?;
     let snapshot = serde_json::to_value(&input)?;
 
     let (card, usage) = analyzer.analyze(&input).await.context("模型分析失败")?;

@@ -117,6 +117,16 @@ enum Cmd {
     /// 看某条 item 的评论过滤结果。跑完前 20 个产品后用它抽查误杀率。
     Filtered { item_id: i64 },
 
+    /// 在 SQLite 和 MySQL 之间搬数据：只增，不改，不删。幂等，可反复跑
+    Dbsync {
+        /// 反向：MySQL → SQLite。默认是 SQLite → MySQL
+        #[arg(long)]
+        reverse: bool,
+        /// 只报告会插入多少行，一行都不写
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// 打印发给模型的 JSON Schema（调试用）
     Schema,
 
@@ -151,12 +161,19 @@ async fn main() -> Result<()> {
     }
 
     let config = Config::load(cli.config.as_deref())?;
-    let pool = db::connect(&config.db.path).await?;
+
+    // dbsync 要同时握着两个库，而且方向由参数决定、不看 [db] backend —— 所以它不走下面
+    // 那条「按配置连一个库」的通用路径
+    if let Cmd::Dbsync { reverse, dry_run } = cli.cmd {
+        return dbsync(&config, reverse, dry_run).await;
+    }
+
+    let pool = db::connect(&config.db).await?;
     db::migrate(&pool).await?;
     let ctx = Ctx::new(config, pool);
 
     match cli.cmd {
-        Cmd::Schema => unreachable!(),
+        Cmd::Schema | Cmd::Dbsync { .. } => unreachable!(),
 
         Cmd::Tui { min_comments } => {
             // 缺 key 不影响浏览，只在按 a 分析时提示
@@ -355,6 +372,54 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// `phi dbsync`。两端都跑一遍 migrations —— 目标库可能还是空的。
+async fn dbsync(config: &phi_core::Config, reverse: bool, dry_run: bool) -> Result<()> {
+    let sqlite = db::connect_sqlite(&config.db.path, config.db.max_connections)
+        .await
+        .with_context(|| format!("打开 SQLite 失败: {}", config.db.path.display()))?;
+    db::migrate(&sqlite).await?;
+    let mysql =
+        db::connect_mysql(&config.db.resolve_mysql_url()?, config.db.max_connections).await?;
+    db::migrate(&mysql).await?;
+
+    let (from, to, arrow) = if reverse {
+        (&mysql, &sqlite, "MySQL → SQLite")
+    } else {
+        (&sqlite, &mysql, "SQLite → MySQL")
+    };
+    db::transfer::reject_same_endpoint(from, to)?;
+
+    println!(
+        "{arrow}{}\n只插入目标库缺少的行，已有的行不改、多出来的行不删。\n",
+        if dry_run {
+            "（dry-run，不写任何数据）"
+        } else {
+            ""
+        }
+    );
+
+    let rep = db::transfer::run(from, to, dry_run).await?;
+    for line in rep.lines() {
+        println!("{line}");
+    }
+    let n = rep.inserted_total();
+    println!();
+    if dry_run {
+        println!("dry-run：会插入 {n} 行。去掉 --dry-run 真正执行。");
+    } else if n == 0 {
+        println!("目标库已经是最新的，没有需要插入的行。");
+    } else {
+        println!("插入 {n} 行。再跑一次这条命令会是 0 —— 它是幂等的。");
+    }
+    if rep.orphans > 0 {
+        println!(
+            "有 {} 行的外键指向不存在的父行，已跳过（源库自身的数据问题）。",
+            rep.orphans
+        );
+    }
     Ok(())
 }
 

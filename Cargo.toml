@@ -30,6 +30,9 @@ schemars = "0.8"
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio-rustls",
     "sqlite",
+    # MySQL 是可选后端（config.toml 的 [db] backend = "mysql"）。不做成 cargo feature ——
+    # 一个自用工具里，「编译时选后端」只会换来「配置改了却报表不存在」这类困惑。
+    "mysql",
     "migrate",
     # macros 只是为了 `sqlx::migrate!` —— 它把 migrations 编译进二进制。
     # 刻意不用 `query!` 宏：那个要求编译期能连上真实数据库（DATABASE_URL），

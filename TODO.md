@@ -137,7 +137,62 @@ maker 对某个质疑的回答，脱离了它回复的那条评论，模型看�
 1. `phi search` 直接复用 `usecase::overview` 的文本搜索（最省事，数据量下 LIKE 足够）
 2. 新 migration 把 fts 表换成 `tokenize = 'trigram'`（SQLite ≥ 3.34；注意 trigram 要求查询词 ≥ 3 个字符，两字中文词仍搜不到）
 
-**相关代码**：`crates/core/src/db.rs` 的 `search_items` / `item_ids_containing`、`migrations/0001_init.sql`
+**相关代码**：`crates/core/src/db.rs` 的 `search_items` / `item_ids_containing`、`migrations/sqlite/0001_init.sql`
+
+## ✅ 已完成（2026-09-16）：MySQL 后端
+
+`[db] backend = "mysql"`，SQLite 仍是默认。方言差异全部集中在 `crates/core/src/db.rs`：
+
+- upsert 子句：`ON CONFLICT ... excluded.x` vs `ON DUPLICATE KEY UPDATE x = VALUES(x)`
+- 取自增 id：MySQL 没有 `RETURNING`，改成事务内第二条语句
+  （`last_insert_rowid()` / `CAST(LAST_INSERT_ID() AS SIGNED)`）。走在事务里是必须的 ——
+  这两个函数都是**连接级**状态，连接池不保证两条语句落在同一条连接上
+- `COUNT(*)` 在 MySQL 是 BIGINT UNSIGNED，sqlx 不肯解成 i64，得套 `CAST(... AS SIGNED)`
+- `LIKE ... ESCAPE`：反斜杠在 MySQL 字符串字面量里会被吃掉，`ESCAPE '\'` 解析不过去，
+  而 `'\\'` 在 SQLite 那边是两个字符。转义字符统一改成 `!`
+- **`cursor` 是 MySQL / MariaDB 的保留字**（SQLite 不是，所以这个坑只在换后端时暴露）。
+  DDL 和共用 DML 都加了反引号 —— 反引号在 SQLite 里同样是合法的标识符引号
+- 布尔列一律按 i64 存取：MySQL 侧是 BIGINT，sqlx 不做窄化解码（原来的 `i32` 会失败）
+- 没有 FTS5，MySQL 后端下 `phi search` 走 LIKE
+
+**实测过的**（2026-09-16，MariaDB **11.4.8**，LAN 上的真实服务器）：
+
+- `cargo test -p phi-core --test mysql`（覆盖 `db.rs` 全部函数）全绿
+- 真实 CLI：`sync` 拉了 80 条真实 PH 数据（两次，第二次验证游标续传）、
+  `hydrate` 抓 12 条评论、`analyze` 真实调用模型写入一张完整卡片（$0.0047）、
+  `note` / `show` / `ls --pending` / `search`
+- **`phi tui` 在 pty 里交互式跑过**：列表加载 20/20、`j` 导航切换选中项并加载详情、
+  `/` 实时搜索、Esc 恢复、`q` 干净退出
+- utf8mb4（emoji 和中文往返）、JSON 列往返、外键级联删除、两次 upsert 不产生重复行
+
+**踩过一次的坑（2026-09-16，已加诊断）**：`phi tui` 报
+`migration 1 is partially applied`。原因是跑的是**修复 `cursor` 保留字之前编译的二进制** ——
+迁移 SQL 被 `sqlx::migrate!` 编译进二进制，改了 `.sql` 不重新 `cargo build` 就还是旧 SQL；
+而 MySQL 的 DDL 不在事务里，失败的迁移不回滚，库就卡在半成品状态。
+
+现在有两道防线：`db::migrate` 的报错直接写出修法；`tests/mysql_admin.rs`（默认只读）
+把库里记的 checksum 和当前二进制内嵌的 checksum 并排列出来，对不上就明确指出「没重新编译」。
+两条提示都实测过（故意把迁移写坏跑了一遍）。
+
+**两个库之间搬数据**：`phi dbsync` / `scripts/dbsync.sh`（默认 SQLite → MySQL，`--reverse` 反向，
+`--dry-run` 预演）。只增不改不删、幂等。难点是 id 重映射 —— 自增主键在两个库里必然不同，
+子表外键要跟着父行在目标库里的新 id 走。已实测：2996 行双向搬运 + 幂等 + 不改不删 +
+`card_fts` 重映射（搜卡片正文能命中），另有门控测试 `transfer_only_inserts_missing_rows`。
+
+**没实测过的**：
+
+1. **真正的 MySQL**（8.x / 5.7）—— 只在 MariaDB 上跑过。`VALUES()` 写法就是为 5.7 兼容保留的
+   （8.0.20 起标记 deprecated），但没验证过
+2. `phi reanalyze`（省一次模型调用）。它依赖的 `get_input_snapshot` 集成测试里覆盖了
+3. `raw` 列超过 `max_allowed_packet` 时的表现。LONGTEXT 装得下，但协议层有包大小上限
+4. **两边迁移 SQL 的语义等价性没人校验**。有个守卫测试
+   （`pipeline.rs` 的 `migrations_stay_in_sync_across_backends`）断言两个目录的文件名集合一致，
+   所以「只改了一边」会当场失败 —— 但它只管文件名
+
+**行为差异（刻意保留）**：`phi search` 在 MySQL 下是**子串** LIKE，不是 FTS5 的分词匹配。
+所以短查询会匹配词内部 —— `phi search AI` 会命中 "Email"。中文场景下 LIKE 反而更准
+（见上面「搜不到中文内容」那条），所以没为 MySQL 补 FULLTEXT：InnoDB 的默认分词同样不切中文，
+要 ngram 插件，而 MariaDB 没有。
 
 ## 🟡 卡片字段退化成标签 / one_liner 照抄 tagline
 

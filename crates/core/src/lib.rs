@@ -1,7 +1,7 @@
 //! phi 的领域内核。
 //!
-//! 这里放：领域模型、`Source` / `Analyzer` 两个 trait、SQLite 仓储、评论预过滤、
-//! 卡片渲染，以及用例层。
+//! 这里放：领域模型、`Source` / `Analyzer` 两个 trait、仓储（SQLite / MySQL）、
+//! 评论预过滤、卡片渲染，以及用例层。
 //!
 //! 关键的分层约束：**用例函数写在 `usecase`，不写在 CLI**。CLI 和以后的 HTTP server
 //! 都只是这些函数的薄包装。这是「v1 不做 Web 但以后不返工」的全部秘诀。
@@ -18,17 +18,18 @@ pub mod render;
 pub mod usecase;
 
 pub use config::Config;
+pub use db::Db;
 pub use ports::{Analyzer, Source};
 
 /// 用例层共享的运行期上下文。`Clone` 很便宜（连接池内部是 Arc），后台任务各持一份。
 #[derive(Clone)]
 pub struct Ctx {
     pub config: Config,
-    pub db: sqlx::SqlitePool,
+    pub db: Db,
 }
 
 impl Ctx {
-    pub fn new(config: Config, db: sqlx::SqlitePool) -> Self {
+    pub fn new(config: Config, db: Db) -> Self {
         Self { config, db }
     }
 }

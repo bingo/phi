@@ -184,7 +184,8 @@ async fn ctx() -> (Ctx, std::path::PathBuf) {
             .unwrap()
             .as_nanos()
     ));
-    let pool = db::connect(&path).await.unwrap();
+    // 测试固定用 SQLite：MySQL 后端需要一台真实服务器，见 tests/mysql.rs
+    let pool = db::connect_sqlite(&path, 4).await.unwrap();
     db::migrate(&pool).await.unwrap();
     (Ctx::new(Config::default(), pool), path)
 }
@@ -222,12 +223,7 @@ async fn full_pipeline() {
     assert!(analysis.card.who_pays.is_none());
 
     // 证据被拆进 evidence 表
-    let ev: Vec<(String, String)> =
-        sqlx::query_as("SELECT field, quote FROM evidence WHERE analysis_id = ?1 ORDER BY field")
-            .bind(analysis.id)
-            .fetch_all(&ctx.db)
-            .await
-            .unwrap();
+    let ev = db::evidence_for(&ctx.db, analysis.id).await.unwrap();
     assert_eq!(ev.len(), 2);
     assert_eq!(ev[0].0, "gap");
     assert_eq!(ev[1].0, "pain");
@@ -265,13 +261,12 @@ async fn reanalyze_appends_and_keeps_history() {
     assert_eq!(history[0].id, second.id, "最新的排在前面");
 
     // 快照可复用：重跑没有重新抓取，输入必须一模一样
-    let snaps: Vec<(String,)> =
-        sqlx::query_as("SELECT input_snapshot FROM analysis WHERE item_id = ?1 ORDER BY id")
-            .bind(item.id)
-            .fetch_all(&ctx.db)
-            .await
-            .unwrap();
-    assert_eq!(snaps[0].0, snaps[1].0, "重跑用的输入快照应当完全一致");
+    let snap_of = |id| db::get_input_snapshot(&ctx.db, id);
+    assert_eq!(
+        snap_of(first.id).await.unwrap(),
+        snap_of(second.id).await.unwrap(),
+        "重跑用的输入快照应当完全一致"
+    );
 
     let diff = render::diff_cards(&first, &second);
     assert!(diff.contains("三轴 A"));
@@ -296,11 +291,7 @@ async fn notes_are_independent_of_analysis() {
         .unwrap();
 
     // 删掉分析，笔记必须还在 —— 两条线完全分离
-    sqlx::query("DELETE FROM analysis WHERE id = ?1")
-        .bind(analysis.id)
-        .execute(&ctx.db)
-        .await
-        .unwrap();
+    db::delete_analysis(&ctx.db, analysis.id).await.unwrap();
 
     let notes = db::load_notes(&ctx.db, item.id).await.unwrap();
     assert_eq!(notes.len(), 1);
@@ -321,11 +312,7 @@ async fn refetch_updates_instead_of_duplicating() {
         .unwrap();
     assert_eq!(id1, id2, "同一个源站 id 不应该产生第二条 item");
 
-    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM comment WHERE item_id = ?1")
-        .bind(id1)
-        .fetch_one(&ctx.db)
-        .await
-        .unwrap();
+    let n = db::count_comments(&ctx.db, id1).await.unwrap();
     assert_eq!(n, 3, "重复抓取不应该产生重复评论");
 
     let _ = std::fs::remove_file(path);
@@ -630,11 +617,7 @@ fn sync_req(since: &str, until: &str) -> SyncRequest {
 }
 
 async fn item_count(ctx: &Ctx) -> i64 {
-    sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM item")
-        .fetch_one(&ctx.db)
-        .await
-        .unwrap()
-        .0
+    db::count_items(&ctx.db).await.unwrap()
 }
 
 #[tokio::test]
@@ -883,4 +866,32 @@ async fn analyze_item_fetches_comments_first_when_missing() {
     );
 
     let _ = std::fs::remove_file(path);
+}
+
+// ---------------------------------------------------------------- 迁移
+
+/// 两套迁移（SQLite / MySQL）必须版本号一一对应。
+///
+/// 这是整个双后端方案里唯一没法靠类型系统守住的地方：只给一边加了迁移，编译能过、
+/// SQLite 的测试全绿，直到某天换成 MySQL 才发现表结构不一样。所以在这里断言文件名
+/// 集合完全相同 —— sqlx 用「版本号_描述」解析迁移，文件名一致就意味着两边的版本序列一致。
+#[test]
+fn migrations_stay_in_sync_across_backends() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+    let names = |dir: &str| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(root.join(dir))
+            .unwrap_or_else(|e| panic!("读不到 migrations/{dir}: {e}"))
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".sql"))
+            .collect();
+        v.sort();
+        v
+    };
+    let (sqlite, mysql) = (names("sqlite"), names("mysql"));
+    assert!(!sqlite.is_empty(), "migrations/sqlite 是空的");
+    assert_eq!(
+        sqlite, mysql,
+        "两个后端的迁移对不上。加迁移时 migrations/sqlite/ 和 migrations/mysql/ \
+         必须放同号同名的文件，否则换后端会拿到不同的 schema"
+    );
 }

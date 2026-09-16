@@ -104,17 +104,101 @@ PH 每个请求固定扣 100 点（6250 点 / 15 分钟，被拒的请求也扣�
 
 ---
 
+## 存储后端
+
+**默认 SQLite**，单文件零运维，什么都不用配。想换 MySQL 就改 `config.toml`：
+
+```toml
+[db]
+backend = "mysql"          # "sqlite"（默认）| "mysql"
+url_env = "PHI_DB_URL"     # export PHI_DB_URL=mysql://user:pass@host:3306/phi
+# url = "mysql://..."      # 也可以直接写在这里，但 DSN 带密码，更推荐上面那行
+max_connections = 4
+```
+
+也可以完全不碰配置文件，用环境变量覆盖：`PHI_DB__BACKEND=mysql`。
+
+库不存在会尝试自动创建；建表时显式写了 `utf8mb4`，不吃服务器默认字符集的坑
+（MySQL 5.7 默认 latin1，中文和 emoji 会被吞掉）。连接失败的报错做了脱敏，
+只打印 `mysql://user:***@host/db`。
+
+**两个后端唯一的行为差异是 `phi search`**：SQLite 走 FTS5，查询串是 FTS5 语法；
+MySQL 没有 fts 镜像表，走**子串** LIKE，按讨论热度排序 —— 所以短查询会匹配到词内部，
+`phi search AI` 会命中 "Email"。其余一切（包括 TUI 里的筛选和搜索，那条路本来就是 LIKE）
+完全一致 —— 理由见 `migrations/mysql/0001_init.sql` 末尾：FTS5 的 `unicode61` 分词器不切中文，
+InnoDB FULLTEXT 要 ngram 插件而 MariaDB 没有，为一个自用工具赌可选插件不值得。
+
+迁移是两套 SQL、版本号一一对应。**加迁移时两个目录都要加同号文件**，
+否则换后端会拿到不同的 schema。
+
+MySQL 后端的集成测试默认不跑（需要真实服务器）：
+
+```bash
+export PHI_TEST_MYSQL_URL='mysql://user:pass@127.0.0.1:3306/phi_test'
+cargo test -p phi-core --test mysql -- --nocapture
+```
+
+它会在目标库里建表、写数据、按本次运行专属的 `source` 值清干净。别指向生产库。
+
+已实测：**MariaDB 11.4.8**（集成测试 + `sync` / `hydrate` / `analyze` / `note` / `show` /
+`search` / `tui` 的真实跑通）。真正的 MySQL 8.x / 5.7 还没验证过，待验证项见 [TODO.md](TODO.md)。
+
+### 两个库之间搬数据
+
+```bash
+scripts/dbsync.sh --dry-run    # 先看会插入多少行，一行都不写
+scripts/dbsync.sh              # SQLite → MySQL
+scripts/dbsync.sh --reverse    # MySQL → SQLite
+```
+
+**只增，不改，不删**：目标库已经有的行原样放过（哪怕内容不同），目标库多出来的行不动。
+所以它是幂等的 —— 同一条命令跑第二次插入 0 行，可以当增量同步反复跑。
+
+两端的连接都取自 `config.toml` 的 `[db]`（SQLite 用 `path`，MySQL 用 `url` / `url_env`），
+**方向只由参数决定，不看 `backend` 那一项**。脚本会先 `cargo build`，免得踩下面那个旧二进制的坑。
+
+不能直接 `INSERT ... SELECT`：`item` / `analysis` / `thesis` 的主键是自增的，两个库里同一条
+数据的 id 必然不同，子表（`comment` / `evidence` / `note` / `card_fts`）照搬就会挂到错误的父行上。
+所以每张父表先按**自然键**在目标库里定位或新建，再用这份映射改写子表外键。自然键和相关取舍
+写在 [crates/core/src/db/transfer.rs](crates/core/src/db/transfer.rs) 的模块文档里 ——
+其中 `analysis` 和 `note` 没有数据库级唯一约束，靠 `created_at` 的微秒精度去重。
+
+`evidence` 和 `card_fts` 只跟着**新插入**的 analysis 走：它们没有可用的身份，
+已存在的分析连带证据一起原样不动，否则重复跑会把证据翻倍。
+
+### 迁移失败了怎么办（只会发生在 MySQL）
+
+**改了 `migrations/` 下的文件一定要重新 `cargo build`。** 迁移 SQL 是被 `sqlx::migrate!`
+**编译进二进制**的，改了文件不重编译，跑的还是旧 SQL —— 而且失败信息会指向新文件，很容易误判。
+
+MySQL / MariaDB 的 DDL 不在事务里，所以一条迁移中途失败不会回滚：部分表已建，
+`_sqlx_migrations` 里留一条 `success = false` 的记录，之后每次启动都报
+`migration N is partially applied`。（SQLite 那边 sqlx 把每条迁移包在事务里，不会有这个问题。）
+
+先查状态 —— 它会直接指出是「旧二进制」还是「真的写错了 SQL」：
+
+```bash
+PHI_TEST_MYSQL_URL=$PHI_DB_URL cargo test -p phi-core --test mysql_admin -- --nocapture
+```
+
+它把库里记的 checksum 和**当前二进制内嵌的** checksum 并排列出来，对不上就是没重新编译。
+默认只读；要动手加 `PHI_ADMIN_ACTION=drop_all`（清空该库，不可逆）或 `=clear_failed`
+（只删失败记录，需要自己先把建到一半的表删掉）。
+
+---
+
 ## 布局
 
 ```
 crates/
-  core/       领域模型、Source/Analyzer trait、SQLite 仓储、过滤、渲染、用例层
+  core/       领域模型、Source/Analyzer trait、仓储（SQLite / MySQL）、过滤、渲染、用例层
   sources/    ProductHunt GraphQL adapter
   analyzer/   OpenRouter + schemars 生成的严格 JSON Schema
   cli/        phi 二进制
   server/     v0.4 占位
 prompts/card.v1.md   prompt 模板，版本号写进每条 analysis
-migrations/          SQLite schema
+migrations/sqlite/   SQLite schema（默认）
+migrations/mysql/    MySQL schema，版本号和 sqlite/ 一一对应
 ```
 
 **业务流程住在 `core::usecase`，不在 CLI。** CLI 和以后的 HTTP server 都只是薄包装 ——
